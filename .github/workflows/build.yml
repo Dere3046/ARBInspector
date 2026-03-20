@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     strategy:
@@ -20,16 +23,17 @@ jobs:
             target: i686-unknown-linux-gnu
             artifact_name: arb_inspector_next_linux_i686
             deps: "gcc-multilib"
+            linker: "i686-linux-gnu-gcc"
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             artifact_name: arb_inspector_next_linux_aarch64
             deps: "gcc-aarch64-linux-gnu"
-            cc: aarch64-linux-gnu-gcc
+            linker: "aarch64-linux-gnu-gcc"
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
             artifact_name: arb_inspector_next_linux_armv7
             deps: "gcc-arm-linux-gnueabihf"
-            cc: arm-linux-gnueabihf-gcc
+            linker: "arm-linux-gnueabihf-gcc"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: arb_inspector_next_windows_x86_64.exe
@@ -52,17 +56,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.deps }}
 
-      - name: Set CC environment variable (Linux cross)
-        if: runner.os == 'Linux' && matrix.cc
-        run: echo "CC=${{ matrix.cc }}" >> $GITHUB_ENV
+      - name: Set linker for cross-compilation (Linux)
+        if: runner.os == 'Linux' && matrix.linker
+        run: |
+          TRIPLE_UPPER=$(echo "${{ matrix.target }}" | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          echo "CARGO_TARGET_${TRIPLE_UPPER}_LINKER=${{ matrix.linker }}" >> $GITHUB_ENV
 
       - name: Build release binary (strip symbols)
         env:
           RUSTFLAGS: "-C strip=symbols"
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} --verbose
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
           path: target/${{ matrix.target }}/release/arb_inspector_next${{ contains(matrix.os, 'windows') && '.exe' || '' }}
+          if-no-files-found: error
