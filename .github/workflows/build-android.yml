@@ -1,0 +1,60 @@
+name: Build for Android
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - i686-linux-android
+          - x86_64-linux-android
+        include:
+          - target: aarch64-linux-android
+            artifact_name: arb_inspector_next_android_arm64
+          - target: armv7-linux-androideabi
+            artifact_name: arb_inspector_next_android_armv7
+          - target: i686-linux-android
+            artifact_name: arb_inspector_next_android_x86
+          - target: x86_64-linux-android
+            artifact_name: arb_inspector_next_android_x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build with cargo-ndk (strip symbols)
+        env:
+          RUSTFLAGS: "-C strip=symbols"
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: cargo ndk --target ${{ matrix.target }} --bindgen -- build --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/arb_inspector_next
