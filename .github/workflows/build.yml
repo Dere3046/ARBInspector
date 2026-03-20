@@ -67,14 +67,6 @@ jobs:
           RUSTFLAGS: "-C strip=symbols"
         run: cargo build --release --target ${{ matrix.target }} --verbose
 
-      - name: List build artifacts (debug)
-        if: always()
-        run: |
-          echo "Build output:"
-          ls -la target/${{ matrix.target }}/release/ || echo "No release directory"
-          echo "Cargo metadata:"
-          cargo metadata --format-version=1 | jq -r '.targets[] | select(.kind[] == "bin") | .name'
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
