@@ -18,28 +18,28 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: arb_inspector_next_linux_x86_64
+            artifact_name: arb_inspector_linux_x86_64
           - os: ubuntu-latest
             target: i686-unknown-linux-gnu
-            artifact_name: arb_inspector_next_linux_i686
-            deps: "gcc-multilib"
+            artifact_name: arb_inspector_linux_i686
+            deps: "gcc-i686-linux-gnu"
             linker: "i686-linux-gnu-gcc"
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            artifact_name: arb_inspector_next_linux_aarch64
+            artifact_name: arb_inspector_linux_aarch64
             deps: "gcc-aarch64-linux-gnu"
             linker: "aarch64-linux-gnu-gcc"
           - os: ubuntu-latest
             target: armv7-unknown-linux-gnueabihf
-            artifact_name: arb_inspector_next_linux_armv7
+            artifact_name: arb_inspector_linux_armv7
             deps: "gcc-arm-linux-gnueabihf"
             linker: "arm-linux-gnueabihf-gcc"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact_name: arb_inspector_next_windows_x86_64.exe
+            artifact_name: arb_inspector_windows_x86_64.exe
           - os: windows-latest
             target: i686-pc-windows-msvc
-            artifact_name: arb_inspector_next_windows_i686.exe
+            artifact_name: arb_inspector_windows_i686.exe
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout code
@@ -67,9 +67,17 @@ jobs:
           RUSTFLAGS: "-C strip=symbols"
         run: cargo build --release --target ${{ matrix.target }} --verbose
 
+      - name: List build artifacts (debug)
+        if: always()
+        run: |
+          echo "Build output:"
+          ls -la target/${{ matrix.target }}/release/ || echo "No release directory"
+          echo "Cargo metadata:"
+          cargo metadata --format-version=1 | jq -r '.targets[] | select(.kind[] == "bin") | .name'
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/arb_inspector_next${{ contains(matrix.os, 'windows') && '.exe' || '' }}
+          path: target/${{ matrix.target }}/release/arb_inspector${{ contains(matrix.os, 'windows') && '.exe' || '' }}
           if-no-files-found: error
