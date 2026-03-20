@@ -7,6 +7,9 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-android:
     runs-on: ubuntu-latest
@@ -20,13 +23,13 @@ jobs:
           - x86_64-linux-android
         include:
           - target: aarch64-linux-android
-            artifact_name: arb_inspector_next_android_arm64
+            artifact_name: arb_inspector_android_arm64
           - target: armv7-linux-androideabi
-            artifact_name: arb_inspector_next_android_armv7
+            artifact_name: arb_inspector_android_armv7
           - target: i686-linux-android
-            artifact_name: arb_inspector_next_android_x86
+            artifact_name: arb_inspector_android_x86
           - target: x86_64-linux-android
-            artifact_name: arb_inspector_next_android_x86_64
+            artifact_name: arb_inspector_android_x86_64
 
     steps:
       - name: Checkout code
@@ -47,14 +50,15 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
 
-      - name: Build with cargo-ndk (strip symbols)
+      - name: Build with cargo-ndk
         env:
           RUSTFLAGS: "-C strip=symbols"
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: cargo ndk --target ${{ matrix.target }} --bindgen -- build --release
+        run: cargo ndk --target ${{ matrix.target }} build --release --verbose
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: target/${{ matrix.target }}/release/arb_inspector_next
+          path: target/${{ matrix.target }}/release/arb_inspector
+          if-no-files-found: error
