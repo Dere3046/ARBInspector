@@ -1,11 +1,13 @@
 [package]
 name = "arb_inspector_next"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Dere"]
 license = "MIT"
 edition = "2021"
 
 [dependencies]
+sha2 = "0.10"
+digest = "0.10"
 
 [[bin]]
 name = "arb_inspector"
