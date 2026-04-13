@@ -8,7 +8,13 @@ edition = "2021"
 [dependencies]
 sha2 = "0.10"
 digest = "0.10"
+thiserror = "1.0"
+anyhow = "1.0"
 
 [[bin]]
 name = "arb_inspector"
 path = "src/main.rs"
+
+[lib]
+name = "arb_inspector_lib"
+path = "src/lib.rs"

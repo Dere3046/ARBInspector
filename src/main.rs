@@ -2,14 +2,19 @@ use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use sha2::{Sha256, Digest};
+use anyhow::Context;
 
 mod elf;
 mod hash_segment;
 mod metadata;
 mod mbn;
+mod error;
+mod verifier;
 
 use elf::*;
 use hash_segment::*;
+use error::{Error, Result};
+use verifier::HashVerifier;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -477,11 +482,12 @@ fn detect_file_type(data: &[u8]) -> FileType {
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
     let mut debug = false;
     let mut quick_mode = false;
     let mut full_mode = false;
+    let mut verify_mode = false;
     let mut path = None;
 
     let mut i = 1;
@@ -499,6 +505,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 full_mode = true;
                 i += 1;
             }
+            "--verify" => {
+                verify_mode = true;
+                i += 1;
+            }
             "--version" | "-v" => {
                 println!("arb_inspector_next version {}", VERSION);
                 return Ok(());
@@ -508,8 +518,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     path = Some(args[i].clone());
                     i += 1;
                 } else {
-                    eprintln!("Usage: {} [--debug] [--quick|--full] [-v] <image>", args[0]);
-                    std::process::exit(1);
+                    anyhow::bail!("Usage: {} [--debug] [--quick|--full] [--verify] [-v] <image>", args[0]);
                 }
             }
         }
@@ -519,13 +528,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         quick_mode = true;
     }
 
-    let path = match path {
-        Some(p) => p,
-        None => {
-            eprintln!("Usage: {} [--debug] [--quick|--full] [-v] <image>", args[0]);
-            std::process::exit(1);
-        }
-    };
+    let path = path.context("No input file provided")?;
 
     let mut file = File::open(&path)?;
     let mut header_buf = [0u8; 64];
@@ -538,12 +541,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if header_buf[EI_DATA] != ELFDATA2LSB {
-                return Err("Not a little-endian ELF file".into());
+                anyhow::bail!("Not a little-endian ELF file");
             }
 
             let elf_class = header_buf[EI_CLASS];
             if elf_class != ELFCLASS32 && elf_class != ELFCLASS64 {
-                return Err("Unsupported ELF class".into());
+                anyhow::bail!("Unsupported ELF class");
             }
 
             if debug {
@@ -587,6 +590,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                     Err(e) => eprintln!("[DEBUG] Failed to compute segment hashes: {}", e),
+                }
+            }
+
+            if verify_mode || debug {
+                if let Some(ref ht) = elf_with_hash.hash_table_info {
+                    let verifier = HashVerifier::new(
+                        &full_data,
+                        &elf_with_hash.program_headers,
+                        &elf_with_hash.elf_info,
+                    );
+                    match verifier.verify(&ht.hashes, ht.common_metadata.as_ref()) {
+                        Ok(()) => {
+                            eprintln!("[VERIFY] All segment hashes match.");
+                        }
+                        Err(e) => {
+                            eprintln!("[VERIFY] Hash verification failed: {}", e);
+                            if verify_mode {
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                } else if verify_mode {
+                    anyhow::bail!("No hash table found, cannot verify");
                 }
             }
 
@@ -810,7 +836,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         FileType::Unknown => {
-            return Err("Unknown file format (not ELF or MBN)".into());
+            anyhow::bail!("Unknown file format (not ELF or MBN)");
         }
     }
 
