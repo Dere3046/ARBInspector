@@ -20,19 +20,20 @@
   - Common Metadata
   - OEM Metadata（含 ARB 版本）
   - Hash Table 内容
-- 计算和验证段哈希
+- 计算和验证段哈希（`--verify`）
 
 ## 使用方法
 
 ```
-arb_inspector_next [--debug] [--quick|--full] [-v] <镜像文件>
+arb_inspector_next [--debug] [--quick|--full] [--verify] [-v] <镜像文件>
 ```
 
 ### 选项
 
-- `--debug` / `-d`: 启用详细调试输出
+- `--debug` / `-d`: 启用详细调试输出（若存在哈希表则自动进行哈希验证）
 - `--quick` / `-q`: 仅输出 ARB 版本号（默认模式）
 - `--full` / `-f`: 输出完整的镜像信息
+- `--verify`: 对 ELF 段进行哈希验证（与存储的哈希表比对）
 - `--version` / `-v`: 显示版本并退出
 
 ### 示例
@@ -44,8 +45,11 @@ arb_inspector_next xbl_config.img
 # 完整模式 - 详细分析
 arb_inspector_next --full xbl_config.img
 
-# 调试模式 - 详细输出
+# 调试模式 - 详细输出并验证哈希
 arb_inspector_next --debug --full xbl_config.img
+
+# 仅验证段哈希（隐含完整模式）
+arb_inspector_next --verify xbl_config.img
 ```
 
 ## 编译
@@ -100,6 +104,13 @@ OEM Metadata:
 
 Anti-Rollback Version: 0
 ```
+
+### 哈希验证输出
+当使用 `--verify` 选项（或在 `--debug` 模式下自动触发）时，工具会计算各段的哈希并与存储的哈希表比对：
+```
+[VERIFY] All segment hashes match.
+```
+若比对失败，则输出错误信息并返回退出码 1。
 
 ## 支持的格式
 

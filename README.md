@@ -20,19 +20,20 @@ A lightweight tool to extract Anti-Rollback (ARB) version from Qualcomm firmware
   - Common Metadata
   - OEM Metadata (with ARB version)
   - Hash Table contents
-- Compute and verify segment hashes
+- Compute and verify segment hashes (`--verify`)
 
 ## Usage
 
 ```
-arb_inspector_next [--debug] [--quick|--full] [-v] <image>
+arb_inspector_next [--debug] [--quick|--full] [--verify] [-v] <image>
 ```
 
 ### Options
 
-- `--debug` / `-d`: Enable verbose debug output
+- `--debug` / `-d`: Enable verbose debug output (also performs hash verification if hash table exists)
 - `--quick` / `-q`: Output only ARB version (default mode)
 - `--full` / `-f`: Output complete image information
+- `--verify`: Perform hash verification of ELF segments against the stored hash table
 - `--version` / `-v`: Show version and exit
 
 ### Examples
@@ -44,8 +45,11 @@ arb_inspector_next xbl_config.img
 # Full mode - detailed analysis
 arb_inspector_next --full xbl_config.img
 
-# Debug mode - verbose output
+# Debug mode - verbose output with hash verification
 arb_inspector_next --debug --full xbl_config.img
+
+# Verify segment hashes only (full mode implied)
+arb_inspector_next --verify xbl_config.img
 ```
 
 ## Build
@@ -100,6 +104,13 @@ OEM Metadata:
 
 Anti-Rollback Version: 0
 ```
+
+### Hash Verification Output
+When `--verify` is used (or automatically in `--debug` mode), the tool will compute segment hashes and compare them with the stored hash table:
+```
+[VERIFY] All segment hashes match.
+```
+On mismatch, an error is printed and the exit code is 1.
 
 ## Supported Formats
 
