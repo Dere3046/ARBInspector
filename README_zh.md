@@ -1,141 +1,106 @@
-# arb_inspector_next
+# arb_inspector
 
 [English Version](README.md)
 
-用于解析高通固件镜像（ELF/MBN 格式）中 Anti-Rollback (ARB) 版本的轻量级工具。
+检测和生成高通安全镜像的工具
 
-## 功能特性
+## 功能
 
-- 解析 32/64 位 ELF 文件（带 Qualcomm HASH 段）
-- 解析 MBN 文件（v3/v5/v6/v7/v8）
+- 解析 32/64 位 ELF 带高通 HASH 段
+- 解析 MBN v3/v5/v6/v7/v8
 - 从 OEM metadata 提取 ARB 版本
-- 支持 Hash Table Segment Header v3/v5/v6/v7/v8
-- 支持 Metadata v0.0/v1.0/v2.0/v3.0/v3.1
-- 支持 Common Metadata v0.0/v0.1
-- 快速模式：仅输出 ARB 值
-- 完整模式：显示详细的镜像信息，包括：
-  - ELF/MBN 头部信息
-  - 程序头及其 Qualcomm OS 段类型
-  - Hash Table Segment Header
-  - Common Metadata
-  - OEM Metadata（含 ARB 版本）
-  - Hash Table 内容
-- 计算和验证段哈希（`--verify`）
+- 检测 QTI/OEM 签名和加密参数
+- 生成哈希段 签名 (ECDSA/RSA) 加密参数
+- LZMA/XZ 压缩和 PIL split
+- 所有功能可在编译时裁剪
 
-## 使用方法
+## 用法
 
 ```
-arb_inspector_next [--debug] [--quick|--full] [--verify] [-v] <镜像文件>
+arb_inspector [--fast] [--debug] [--verify] <镜像>
+arb_inspector secure-image [选项]
 ```
 
-### 选项
+无参数 = 完整显示
+`--fast` = 只输出 ARB
+`--debug` = 逐步追踪
 
-- `--debug` / `-d`: 启用详细调试输出（若存在哈希表则自动进行哈希验证）
-- `--quick` / `-q`: 仅输出 ARB 版本号（默认模式）
-- `--full` / `-f`: 输出完整的镜像信息
-- `--verify`: 对 ELF 段进行哈希验证（与存储的哈希表比对）
-- `--version` / `-v`: 显示版本并退出
+### secure-image
 
-### 示例
+```
+--infile <路径>  --outfile <路径>
+--hash           生成哈希表段
+--sign           签名 (local|test|plugin)
+--encrypt        添加加密参数 (qbec|uie)
+--inspect        打印镜像信息
+--validate       校验
+--compress       LZMA 压缩输出
+--pil-split      分割为 .mdt + .bXX
+```
+
+### 编译
+
+```
+cargo build --release                     # 全功能
+cargo build --no-default-features         # 仅检测
+cargo build --features sign               # +签名
+cargo build --features "sign encrypt"     # +加密
+```
+
+## 示例
 
 ```bash
-# 快速模式 - 仅输出 ARB 版本
-arb_inspector_next xbl_config.img
+# 快速查看 ARB
+arb_inspector --fast xbl_a
 
-# 完整模式 - 详细分析
-arb_inspector_next --full xbl_config.img
+# 完整查看
+arb_inspector abl_a
 
-# 调试模式 - 详细输出并验证哈希
-arb_inspector_next --debug --full xbl_config.img
+# 生成哈希段 更新 ARB
+arb_inspector secure-image --infile abl_a --outfile abl_new.elf --hash --anti-rollback-version 5
 
-# 仅验证段哈希（隐含完整模式）
-arb_inspector_next --verify xbl_config.img
+# 哈希 + 签名 使用内建 ECDSA 测试证书
+arb_inspector secure-image --infile abl_a --outfile abl_signed.elf --hash --sign --signing-mode test
 ```
 
-## 编译
+### 输出示例
 
-```bash
-cargo build --release
 ```
-
-编译后的二进制文件位于 `target/release/arb_inspector`（Windows 上为 `arb_inspector.exe`）。
-
-## 输出格式
-
-### 快速模式
-仅输出 ARB 版本号：
-```
-0
-```
-
-### 完整模式
-输出详细信息：
-```
-File: xbl_config.img
+File: xbl_a
 Format: ELF (64-bit)
-Entry point: 0x1494e000
-Machine: 0x1
-Type: 0x2
-Flags: 0x5
-Program headers: 8
-
-Program Headers:
-  [0] Type: NULL Offset: 0x0 VAddr: 0x0 FileSize: 0x200 MemSize: 0x0
-      Flags: 0x7000000 Perm: None OS_Type: PHDR OS_Access: RW Page_Mode: NON_PAGED
-  ...
+Program headers: 9
 
 Hash Table Segment Header:
   Version: 7
   Common Metadata Size: 24 (bytes)
-  QTI Metadata Size: 0 (bytes)
   OEM Metadata Size: 224 (bytes)
-  Hash Table Size: 384 (bytes)
-  ...
+  Hash Table Size: 432 (bytes)
+
+Signed: Yes (QTI + OEM)
 
 Common Metadata:
   Version: 0.0
-  One-shot Hash Algorithm: 37
-  Segment Hash Algorithm: 0
+  Software ID: 0x36
+  Hash Table Algorithm: SHA384 (3)
 
 OEM Metadata:
   Version: 3.0
   Anti-Rollback Version: 0
-  ...
 
 Anti-Rollback Version: 0
 ```
 
-### 哈希验证输出
-当使用 `--verify` 选项（或在 `--debug` 模式下自动触发）时，工具会计算各段的哈希并与存储的哈希表比对：
-```
-[VERIFY] All segment hashes match.
-```
-若比对失败，则输出错误信息并返回退出码 1。
+## Metadata 格式
 
-## 支持的格式
+Common Metadata V0.0 24 字节
+  major minor software_id secondary_sw_id hash_table_algo mrc_target
 
-### ELF 文件
-- 32 位和 64 位 ELF
-- Qualcomm OS 段类型（AMSS、HASH、PHDR 等）
-- 带 metadata 的 Hash Table Segment
+OEM Metadata V2.0/V3.0 224 字节
+  12 个 soc_hw_vers product_segment_id jtag_id 8 个 serial u64
+  oem_id oem_product_id lifecycle states oem_rch_hash flags
 
-### MBN 文件
-- MBN v3、v5、v6、v7、v8
-- 镜像头部解析
-
-## Metadata 版本
-
-### Common Metadata
-- v0.0: 基础哈希算法配置
-- v0.1: 添加 ZI 段哈希算法支持
-
-### OEM Metadata
-- v0.0: 基础 ARB 和平台绑定
-- v1.0: 添加 JTAG ID 和 OEM Product ID 绑定
-- v2.0: 添加生命周期状态和 OEM 根证书哈希
-- v3.0: 添加 QTI 生命周期状态
-- v3.1: 添加测量寄存器目标
+OEM Metadata V0.0/V1.0 120 字节 (v6 旧格式)
 
 ## 许可证
 
-MIT - 详见 [LICENSE](LICENSE)
+MIT

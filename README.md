@@ -1,141 +1,110 @@
-# arb_inspector_next
+# arb_inspector
 
 [中文版](README_zh.md)
 
-A lightweight tool to extract Anti-Rollback (ARB) version from Qualcomm firmware images (ELF/MBN formats).
+Inspect and generate Qualcomm secure ELF/MBN images.
 
 ## Features
 
-- Parse 32/64-bit ELF files with Qualcomm HASH segment
-- Parse MBN files (v3/v5/v6/v7/v8)
-- Extract ARB version from OEM metadata
-- Support Hash Table Segment Header v3/v5/v6/v7/v8
-- Support Metadata v0.0/v1.0/v2.0/v3.0/v3.1
-- Support Common Metadata v0.0/v0.1
-- Quick mode: output only ARB value
-- Full mode: display detailed image information including:
-  - ELF/MBN header information
-  - Program headers with Qualcomm OS segment types
-  - Hash Table Segment Header
-  - Common Metadata
-  - OEM Metadata (with ARB version)
-  - Hash Table contents
-- Compute and verify segment hashes (`--verify`)
+- Parse 32/64-bit ELF with Qualcomm HASH segment
+- Parse MBN v3/v5/v6/v7/v8
+- Extract Anti-Rollback version from OEM metadata
+- Detect QTI/OEM signatures and encryption params
+- Generate hash segments, sign (ECDSA/RSA), encrypt params
+- LZMA/XZ compression and PIL split
+- All features are compile-time gated for minimal builds
 
 ## Usage
 
 ```
-arb_inspector_next [--debug] [--quick|--full] [--verify] [-v] <image>
+arb_inspector [--fast] [--debug] [--verify] <image>
+arb_inspector secure-image [options]
 ```
 
-### Options
+No flags = full display (default).
+`--fast` = only ARB value.
+`--debug` = step by step trace.
 
-- `--debug` / `-d`: Enable verbose debug output (also performs hash verification if hash table exists)
-- `--quick` / `-q`: Output only ARB version (default mode)
-- `--full` / `-f`: Output complete image information
-- `--verify`: Perform hash verification of ELF segments against the stored hash table
-- `--version` / `-v`: Show version and exit
+### secure-image
 
-### Examples
+```
+--infile <path>  --outfile <path>
+--hash           generate hash table segment
+--sign           sign image (local|test|plugin)
+--encrypt        add encryption params (qbec|uie)
+--inspect        print image details
+--validate       validate against profile
+--compress       LZMA compress output
+--pil-split      split into .mdt + .bXX
+```
+
+### Build notes
+
+```
+cargo build --release                          # full
+cargo build --no-default-features              # inspect only
+cargo build --features sign                    # +signing
+cargo build --features "sign encrypt"          # +encryption
+```
+
+## Example
 
 ```bash
-# Quick mode - output only ARB version
-arb_inspector_next xbl_config.img
+# Quick ARB
+arb_inspector --fast xbl_a
 
-# Full mode - detailed analysis
-arb_inspector_next --full xbl_config.img
+# Full inspect
+arb_inspector abl_a
 
-# Debug mode - verbose output with hash verification
-arb_inspector_next --debug --full xbl_config.img
+# Generate hash segment with updated ARB
+arb_inspector secure-image --infile abl_a --outfile abl_new.elf --hash --anti-rollback-version 5
 
-# Verify segment hashes only (full mode implied)
-arb_inspector_next --verify xbl_config.img
+# Hash + sign with built-in ECDSA test certs
+arb_inspector secure-image --infile abl_a --outfile abl_signed.elf --hash --sign --signing-mode test
 ```
 
-## Build
+### Output
 
-```bash
-cargo build --release
 ```
-
-The binary will be available at `target/release/arb_inspector` (or `arb_inspector.exe` on Windows).
-
-## Output Format
-
-### Quick Mode
-Outputs only the ARB version number:
-```
-0
-```
-
-### Full Mode
-Outputs detailed information:
-```
-File: xbl_config.img
+File: xbl_a
 Format: ELF (64-bit)
-Entry point: 0x1494e000
-Machine: 0x1
-Type: 0x2
-Flags: 0x5
-Program headers: 8
-
-Program Headers:
-  [0] Type: NULL Offset: 0x0 VAddr: 0x0 FileSize: 0x200 MemSize: 0x0
-      Flags: 0x7000000 Perm: None OS_Type: PHDR OS_Access: RW Page_Mode: NON_PAGED
-  ...
+Machine: 0xb7
+Program headers: 9
 
 Hash Table Segment Header:
   Version: 7
   Common Metadata Size: 24 (bytes)
-  QTI Metadata Size: 0 (bytes)
   OEM Metadata Size: 224 (bytes)
-  Hash Table Size: 384 (bytes)
-  ...
+  Hash Table Size: 432 (bytes)
+  QTI Signature Size: 104 (bytes)
+  OEM Signature Size: 104 (bytes)
+
+Signed: Yes (QTI + OEM)
 
 Common Metadata:
   Version: 0.0
-  One-shot Hash Algorithm: 37
-  Segment Hash Algorithm: 0
+  Software ID: 0x36
+  Hash Table Algorithm: SHA384 (3)
 
 OEM Metadata:
   Version: 3.0
   Anti-Rollback Version: 0
-  ...
+  OEM ID: 0x51
 
 Anti-Rollback Version: 0
 ```
 
-### Hash Verification Output
-When `--verify` is used (or automatically in `--debug` mode), the tool will compute segment hashes and compare them with the stored hash table:
-```
-[VERIFY] All segment hashes match.
-```
-On mismatch, an error is printed and the exit code is 1.
+## Metadata formats
 
-## Supported Formats
+Common metadata V0.0: 24B
+  major, minor, software_id, secondary_sw_id, hash_table_algo, mrc_target
 
-### ELF Files
-- 32-bit and 64-bit ELF
-- Qualcomm OS segment types (AMSS, HASH, PHDR, etc.)
-- Hash Table Segment with metadata
+OEM metadata V2.0/V3.0: 224B
+  12 soc_hw_vers, product_segment_id, jtag_id, 8 serial u64,
+  oem_id, oem_product_id, lifecycle states, oem_rch_hash, flags
 
-### MBN Files
-- MBN v3, v5, v6, v7, v8
-- Image header parsing
-
-## Metadata Versions
-
-### Common Metadata
-- v0.0: Basic hash algorithm configuration
-- v0.1: Added ZI segment hash algorithm support
-
-### OEM Metadata
-- v0.0: Basic ARB and platform binding
-- v1.0: Added JTAG ID and OEM Product ID binding
-- v2.0: Added lifecycle states and OEM root certificate hash
-- v3.0: Added QTI lifecycle state
-- v3.1: Added measurement register target
+OEM metadata V0.0/V1.0: 120B (legacy v6 format)
 
 ## License
 
-MIT - See [LICENSE](LICENSE)
+MIT
