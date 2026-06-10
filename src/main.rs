@@ -20,8 +20,7 @@ mod compress;
 mod sign;
 mod validate;
 
-use cli::args::{GlobalArgs, SecureImageArgs};
-use cli::secure_image::cmdline_dict;
+
 use cli::secure_image::handler;
 use elf::defines::{
     self as elf_defs, os_access_type_to_string, os_page_mode_to_string, os_segment_type_to_string,
