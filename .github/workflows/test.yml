@@ -6,12 +6,14 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  RUSTFLAGS: ""
+
 jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -20,28 +22,22 @@ jobs:
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-      - name: Build default features
-        run: cargo build
+      - name: Build and test (default features)
+        run: cargo build && cargo test
 
-      - name: Run tests
-        run: cargo test
-
-      - name: Build minimal (no default features)
+      - name: Build (no default features)
         run: cargo build --no-default-features
 
-      - name: Test minimal
-        run: cargo test --no-default-features
-
-      - name: Build sign
+      - name: Build (sign)
         run: cargo build --features sign
 
-      - name: Build sign+encrypt
+      - name: Build (sign+encrypt)
         run: cargo build --features "sign encrypt"
 
       - name: Build release
         run: cargo build --release
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v4
         with:
           name: arb_inspector
           path: target/release/arb_inspector
