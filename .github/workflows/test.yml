@@ -17,19 +17,25 @@ jobs:
         with:
           toolchain: stable
 
-      - name: Build all features
-        run: cargo build --all-features
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
 
-      - name: Run all tests
-        run: cargo test --all-features
+      - name: Build default features
+        run: cargo build
 
-      - name: Build minimal (inspect only)
+      - name: Run tests
+        run: cargo test
+
+      - name: Build minimal (no default features)
         run: cargo build --no-default-features
 
-      - name: Build with sign
+      - name: Test minimal
+        run: cargo test --no-default-features
+
+      - name: Build sign
         run: cargo build --features sign
 
-      - name: Build with sign+encrypt
+      - name: Build sign+encrypt
         run: cargo build --features "sign encrypt"
 
       - name: Build release
