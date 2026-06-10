@@ -1,15 +1,34 @@
 [package]
 name = "arb_inspector_next"
-version = "0.3.0"
+version = "0.4.0"
 authors = ["Dere"]
 license = "MIT"
 edition = "2021"
+
+[features]
+default = ["full"]
+full = ["inspect", "hash-gen", "sign", "encrypt", "validate", "compress"]
+inspect = []
+hash-gen = []
+sign = ["openssl"]
+encrypt = []
+validate = []
+compress = ["lzma-rs"]
 
 [dependencies]
 sha2 = "0.10"
 digest = "0.10"
 thiserror = "1.0"
 anyhow = "1.0"
+
+# Sign/encrypt optionally use openssl for RSA/ECDSA/cert operations
+openssl = { version = "0.10", optional = true }
+
+# QBEC/UIE encryption
+aes-gcm = { version = "0.10", optional = true }
+hkdf = { version = "0.12", optional = true }
+
+lzma-rs = { version = "0.3", optional = true }
 
 [[bin]]
 name = "arb_inspector"

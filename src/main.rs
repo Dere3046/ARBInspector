@@ -1,465 +1,44 @@
 use std::env;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use sha2::{Sha256, Digest};
+
 use anyhow::Context;
 
+mod data;
 mod elf;
-mod hash_segment;
-mod metadata;
-mod mbn;
+mod encrypt;
 mod error;
+mod hash_segment;
+mod mbn;
 mod verifier;
 
-use elf::*;
-use hash_segment::*;
-use error::{Error, Result};
+mod cli;
+mod config;
+mod core;
+mod cipher;
+mod compress;
+mod sign;
+mod validate;
+
+use cli::args::{GlobalArgs, SecureImageArgs};
+use cli::secure_image::cmdline_dict;
+use cli::secure_image::handler;
+use elf::defines::{
+    self as elf_defs, os_access_type_to_string, os_page_mode_to_string, os_segment_type_to_string,
+    p_flags_os_access_type, p_flags_os_page_mode, p_flags_os_segment_type, perm_to_string,
+    p_type_to_string, ELFDATA2LSB,
+};
+use elf::header::ElfHeader;
+use elf::parser::ElfParser;
+use elf::program_header::ProgramHeader;
+use hash_segment::defines::{self as hs_defs, ARB_VALUE_MAX};
+use hash_segment::encryption::qbec;
+use hash_segment::metadata::{CommonMetadata, Metadata};
+use hash_segment::parser::HashSegmentInfo;
+use crate::error::Error;
 use verifier::HashVerifier;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const OS_TYPE_HASH: u32 = 0x2;
-
-#[inline]
-fn read_le_u16(buf: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(buf[off..off+2].try_into().unwrap())
-}
-
-#[inline]
-fn read_le_u32(buf: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(buf[off..off+4].try_into().unwrap())
-}
-
-#[inline]
-fn read_le_u64(buf: &[u8], off: usize) -> u64 {
-    u64::from_le_bytes(buf[off..off+8].try_into().unwrap())
-}
-
-fn compute_sha256(data: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    hasher.finalize().to_vec()
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct HashTableSegmentHeader {
-    reserved: u32,
-    version: u32,
-    common_metadata_size: u32,
-    qti_metadata_size: u32,
-    oem_metadata_size: u32,
-    hash_table_size: u32,
-    qti_sig_size: u32,
-    qti_cert_chain_size: u32,
-    oem_sig_size: u32,
-    oem_cert_chain_size: u32,
-}
-
-impl HashTableSegmentHeader {
-    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < HASH_TABLE_HEADER_SIZE {
-            return Err("Insufficient data for hash table header");
-        }
-        Ok(Self {
-            reserved: read_le_u32(data, 0),
-            version: read_le_u32(data, 4),
-            common_metadata_size: read_le_u32(data, 8),
-            qti_metadata_size: read_le_u32(data, 12),
-            oem_metadata_size: read_le_u32(data, 16),
-            hash_table_size: read_le_u32(data, 20),
-            qti_sig_size: read_le_u32(data, 24),
-            qti_cert_chain_size: read_le_u32(data, 28),
-            oem_sig_size: read_le_u32(data, 32),
-            oem_cert_chain_size: read_le_u32(data, 36),
-        })
-    }
-
-    fn is_plausible(&self) -> bool {
-        let common_sz = self.common_metadata_size as usize;
-        let qti_sz = self.qti_metadata_size as usize;
-        let oem_sz = self.oem_metadata_size as usize;
-        let hash_sz = self.hash_table_size as usize;
-
-        (VERSION_MIN..=VERSION_MAX).contains(&self.version) &&
-        common_sz <= COMMON_SIZE_MAX &&
-        qti_sz <= QTI_SIZE_MAX &&
-        oem_sz <= OEM_SIZE_MAX &&
-        hash_sz > 0 && hash_sz <= HASH_TABLE_SIZE_MAX
-    }
-
-    fn header_size(&self) -> usize {
-        HASH_TABLE_HEADER_SIZE
-    }
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct Elf32ProgramHeader {
-    p_type: u32,
-    p_offset: u32,
-    p_vaddr: u32,
-    p_paddr: u32,
-    p_filesz: u32,
-    p_memsz: u32,
-    p_flags: u32,
-    p_align: u32,
-}
-
-impl Elf32ProgramHeader {
-    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < ELF32_PHDR_SIZE {
-            return Err("Insufficient data for ELF32 program header");
-        }
-        Ok(Self {
-            p_type: read_le_u32(data, 0),
-            p_offset: read_le_u32(data, 4),
-            p_vaddr: read_le_u32(data, 8),
-            p_paddr: read_le_u32(data, 12),
-            p_filesz: read_le_u32(data, 16),
-            p_memsz: read_le_u32(data, 20),
-            p_flags: read_le_u32(data, 24),
-            p_align: read_le_u32(data, 28),
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct Elf64ProgramHeader {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-    p_align: u64,
-}
-
-impl Elf64ProgramHeader {
-    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < ELF64_PHDR_SIZE {
-            return Err("Insufficient data for ELF64 program header");
-        }
-        Ok(Self {
-            p_type: read_le_u32(data, 0),
-            p_flags: read_le_u32(data, 4),
-            p_offset: read_le_u64(data, 8),
-            p_vaddr: read_le_u64(data, 16),
-            p_paddr: read_le_u64(data, 24),
-            p_filesz: read_le_u64(data, 32),
-            p_memsz: read_le_u64(data, 40),
-            p_align: read_le_u64(data, 48),
-        })
-    }
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct ElfInfo {
-    elf_class: u8,
-    e_entry: u64,
-    e_phoff: u64,
-    e_phnum: u16,
-    e_phentsize: u16,
-    e_flags: u32,
-    e_machine: u16,
-    e_type: u16,
-}
-
-#[derive(Debug)]
-#[allow(dead_code)]
-struct ProgramHeaderInfo {
-    p_type: u32,
-    p_flags: u32,
-    p_offset: u64,
-    p_vaddr: u64,
-    p_paddr: u64,
-    p_filesz: u64,
-    p_memsz: u64,
-}
-
-#[derive(Debug)]
-struct HashTableInfo {
-    header: HashTableSegmentHeader,
-    common_metadata: Option<metadata::CommonMetadata>,
-    oem_metadata: Option<metadata::Metadata>,
-    serial_num: Option<u32>,
-    hashes: Vec<Vec<u8>>,
-}
-
-#[derive(Debug)]
-struct ElfWithHashTable {
-    elf_info: ElfInfo,
-    program_headers: Vec<ProgramHeaderInfo>,
-    hash_table_info: Option<HashTableInfo>,
-}
-
-impl ElfWithHashTable {
-    fn from_bytes(data: &[u8]) -> Result<Self, &'static str> {
-        if data.len() < 16 || &data[0..4] != &ELF_MAGIC {
-            return Err("Invalid ELF magic");
-        }
-
-        let elf_class = data[EI_CLASS];
-        let elf_info = match elf_class {
-            ELFCLASS32 => {
-                if data.len() < ELF32_HDR_SIZE {
-                    return Err("Insufficient data for ELF32 header");
-                }
-                ElfInfo {
-                    elf_class,
-                    e_type: read_le_u16(data, 16),
-                    e_machine: read_le_u16(data, 18),
-                    e_entry: read_le_u32(data, 24) as u64,
-                    e_phoff: read_le_u32(data, 28) as u64,
-                    e_flags: read_le_u32(data, 36),
-                    e_phnum: read_le_u16(data, 44),
-                    e_phentsize: read_le_u16(data, 42),
-                }
-            }
-            ELFCLASS64 => {
-                if data.len() < ELF64_HDR_SIZE {
-                    return Err("Insufficient data for ELF64 header");
-                }
-                ElfInfo {
-                    elf_class,
-                    e_type: read_le_u16(data, 16),
-                    e_machine: read_le_u16(data, 18),
-                    e_entry: read_le_u64(data, 24),
-                    e_phoff: read_le_u64(data, 32),
-                    e_flags: read_le_u32(data, 48),
-                    e_phnum: read_le_u16(data, 56),
-                    e_phentsize: read_le_u16(data, 54),
-                }
-            }
-            _ => return Err("Unsupported ELF class"),
-        };
-
-        let mut program_headers = Vec::with_capacity(elf_info.e_phnum as usize);
-        for i in 0..elf_info.e_phnum {
-            let offset = (elf_info.e_phoff + (i as u64) * (elf_info.e_phentsize as u64)) as usize;
-            if offset + (elf_info.e_phentsize as usize) > data.len() {
-                continue;
-            }
-
-            let phdr_info = match elf_class {
-                ELFCLASS32 => {
-                    let phdr = Elf32ProgramHeader::from_bytes(&data[offset..offset + ELF32_PHDR_SIZE])?;
-                    ProgramHeaderInfo {
-                        p_type: phdr.p_type,
-                        p_flags: phdr.p_flags,
-                        p_offset: phdr.p_offset as u64,
-                        p_vaddr: phdr.p_vaddr as u64,
-                        p_paddr: phdr.p_paddr as u64,
-                        p_filesz: phdr.p_filesz as u64,
-                        p_memsz: phdr.p_memsz as u64,
-                    }
-                }
-                ELFCLASS64 => {
-                    let phdr = Elf64ProgramHeader::from_bytes(&data[offset..offset + ELF64_PHDR_SIZE])?;
-                    ProgramHeaderInfo {
-                        p_type: phdr.p_type,
-                        p_flags: phdr.p_flags,
-                        p_offset: phdr.p_offset,
-                        p_vaddr: phdr.p_vaddr,
-                        p_paddr: phdr.p_paddr,
-                        p_filesz: phdr.p_filesz,
-                        p_memsz: phdr.p_memsz,
-                    }
-                }
-                _ => unreachable!(),
-            };
-            program_headers.push(phdr_info);
-        }
-
-        let mut hash_table_info = None;
-
-        for phdr in &program_headers {
-            let os_type = get_os_segment_type(phdr.p_flags);
-            if os_type == OS_TYPE_HASH {
-                let p_offset = phdr.p_offset as usize;
-                let p_filesz = phdr.p_filesz as usize;
-
-                if p_offset + p_filesz <= data.len() && p_filesz >= HASH_TABLE_HEADER_SIZE {
-                    if let Ok(ht_header) = HashTableSegmentHeader::from_bytes(&data[p_offset..p_offset + HASH_TABLE_HEADER_SIZE_V7]) {
-                        if ht_header.is_plausible() {
-                            let header_size = ht_header.header_size();
-                            let mut offset = p_offset + header_size;
-
-                            let mut common_metadata = None;
-                            let mut oem_metadata = None;
-                            let mut serial_num = None;
-                            let mut hashes = Vec::new();
-
-                            if ht_header.common_metadata_size > 0 && offset + ht_header.common_metadata_size as usize <= data.len() {
-                                let cm_data = &data[offset..offset + ht_header.common_metadata_size as usize];
-                                if cm_data.len() >= 8 {
-                                    let cm_major = read_le_u32(cm_data, 0);
-                                    let cm_minor = read_le_u32(cm_data, 4);
-                                    if let Ok(cm) = metadata::CommonMetadata::from_bytes(cm_data, cm_major, cm_minor) {
-                                        common_metadata = Some(cm);
-                                    }
-                                }
-                                offset += ht_header.common_metadata_size as usize;
-                            }
-
-                            if ht_header.oem_metadata_size > 0 && offset + ht_header.oem_metadata_size as usize <= data.len() {
-                                let oem_data = &data[offset..offset + ht_header.oem_metadata_size as usize];
-                                if oem_data.len() >= 12 {
-                                    let oem_major = read_le_u32(oem_data, 0);
-                                    let oem_minor = read_le_u32(oem_data, 4);
-                                    let arb_candidate = read_le_u32(oem_data, 8);
-                                    
-                                    if ht_header.version == 7 && oem_data.len() >= 12 && arb_candidate <= ARB_VALUE_MAX {
-                                        oem_metadata = Some(metadata::Metadata::V20(metadata::MetadataV20 {
-                                            major_version: oem_major,
-                                            minor_version: oem_minor,
-                                            anti_rollback_version: arb_candidate,
-                                            mrc_index: if oem_data.len() > 12 { read_le_u32(oem_data, 12) } else { 0 },
-                                            soc_hw_vers: [0; 32],
-                                            soc_feature_id: 0,
-                                            jtag_id: 0,
-                                            serial_numbers: [0; 8],
-                                            oem_id: 0,
-                                            oem_product_id: 0,
-                                            soc_lifecycle_state: 0,
-                                            oem_lifecycle_state: 0,
-                                            oem_root_certificate_hash_algorithm: 0,
-                                            oem_root_certificate_hash: [0; 64],
-                                            flags: 0,
-                                        }));
-                                    } else if let Ok(om) = metadata::Metadata::from_bytes(oem_data, oem_major, oem_minor) {
-                                        oem_metadata = Some(om);
-                                    }
-                                }
-                            }
-
-                            let hash_table_offset = offset;
-                            let hash_table_size = ht_header.hash_table_size as usize;
-                            if hash_table_offset + hash_table_size <= data.len() && hash_table_size > 0 {
-                                let hash_table = &data[hash_table_offset..hash_table_offset + hash_table_size];
-                                
-                                let hash_size = SHA256_SIZE;
-                                let mut ht_offset = 0;
-
-                                if hash_table.len() >= hash_size * 2 {
-                                    let potential_serial = read_le_u32(&hash_table, hash_size);
-                                    let mut is_valid_serial = true;
-                                    for i in 0..hash_size {
-                                        if hash_table[i] != 0 {
-                                            is_valid_serial = false;
-                                            break;
-                                        }
-                                    }
-                                    if is_valid_serial && potential_serial != 0 {
-                                        serial_num = Some(potential_serial);
-                                        ht_offset = hash_size * 2;
-                                    }
-                                }
-
-                                while ht_offset + hash_size <= hash_table.len() {
-                                    let hash = hash_table[ht_offset..ht_offset + hash_size].to_vec();
-                                    hashes.push(hash);
-                                    ht_offset += hash_size;
-                                }
-                            }
-
-                            hash_table_info = Some(HashTableInfo {
-                                header: ht_header,
-                                common_metadata,
-                                oem_metadata,
-                                serial_num,
-                                hashes,
-                            });
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(Self {
-            elf_info,
-            program_headers,
-            hash_table_info,
-        })
-    }
-
-    fn get_arb_version(&self) -> Option<u32> {
-        self.hash_table_info.as_ref().and_then(|ht| {
-            ht.oem_metadata.as_ref().map(|m| m.get_arb_version())
-        })
-    }
-
-    fn compute_segment_hashes(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
-        let mut hashes = Vec::new();
-
-        for phdr in &self.program_headers {
-            let flags = phdr.p_flags;
-            let os_seg_type = get_os_segment_type(flags);
-            let os_access = get_os_access_type(flags);
-            let os_page_mode = get_os_page_mode(flags);
-
-            if os_seg_type == PF_OS_SEGMENT_HASH {
-                continue;
-            }
-
-            if os_access == PF_OS_ACCESS_NOTUSED || os_access == PF_OS_ACCESS_SHARED {
-                hashes.push(vec![0u8; SHA256_SIZE]);
-                continue;
-            }
-
-            if phdr.p_filesz == 0 {
-                hashes.push(vec![0u8; SHA256_SIZE]);
-                continue;
-            }
-
-            let seg_data = if phdr.p_type == PT_PHDR {
-                let start = self.elf_info.e_phoff as usize;
-                let end = start + (self.elf_info.e_phnum as usize * self.elf_info.e_phentsize as usize);
-                if end <= data.len() {
-                    &data[start..end]
-                } else {
-                    &[]
-                }
-            } else {
-                let start = phdr.p_offset as usize;
-                let end = start + phdr.p_filesz as usize;
-                if end <= data.len() {
-                    &data[start..end]
-                } else {
-                    &[]
-                }
-            };
-
-            if os_page_mode == PF_OS_NON_PAGED_SEGMENT {
-                let hash = compute_sha256(seg_data);
-                hashes.push(hash);
-            } else if os_page_mode == PF_OS_PAGED_SEGMENT {
-                let mut offset = 0;
-                let nonalign = phdr.p_vaddr & (ELF_BLOCK_ALIGN - 1);
-                if nonalign != 0 {
-                    offset = (ELF_BLOCK_ALIGN - nonalign) as usize;
-                }
-
-                let mut page_data = seg_data;
-                if offset < page_data.len() {
-                    page_data = &page_data[offset..];
-                }
-
-                while page_data.len() >= ELF_BLOCK_ALIGN as usize {
-                    let hash = compute_sha256(&page_data[..ELF_BLOCK_ALIGN as usize]);
-                    hashes.push(hash);
-                    page_data = &page_data[ELF_BLOCK_ALIGN as usize..];
-                }
-            }
-        }
-
-        Ok(hashes)
-    }
-}
 
 enum FileType {
     Elf,
@@ -468,11 +47,11 @@ enum FileType {
 }
 
 fn detect_file_type(data: &[u8]) -> FileType {
-    if data.starts_with(&ELF_MAGIC) {
+    if data.starts_with(&elf_defs::ELFMAG) {
         FileType::Elf
     } else if data.len() >= 8 {
-        let version = read_le_u32(data, 4);
-        if [3, 5, 6, 7, 8].contains(&version) {
+        let version = data::read_le_u32(data, 4);
+        if hs_defs::is_valid_hash_segment_version(version) {
             FileType::Mbn
         } else {
             FileType::Unknown
@@ -482,11 +61,588 @@ fn detect_file_type(data: &[u8]) -> FileType {
     }
 }
 
+fn print_phdr_debug(phdrs: &[ProgramHeader], _elf_class: u8) {
+    for (i, ph) in phdrs.iter().enumerate() {
+        let flags = ph.p_flags;
+        let perm = elf_defs::get_perm_value(flags);
+        let os_seg = p_flags_os_segment_type(flags);
+        let os_access = p_flags_os_access_type(flags);
+        let os_page = p_flags_os_page_mode(flags);
+        eprintln!(
+            "[DEBUG] PH[{}]: type={:#x} offset=0x{:x} filesz=0x{:x} flags={:#x}",
+            i, ph.p_type, ph.p_offset, ph.p_filesz, flags
+        );
+        eprintln!(
+            "[DEBUG]        Perm: {} OS_Seg: {} OS_Access: {} Page: {}",
+            perm_to_string(perm),
+            os_segment_type_to_string(os_seg),
+            os_access_type_to_string(os_access),
+            os_page_mode_to_string(os_page),
+        );
+    }
+}
+
+fn print_full_output(
+    path: &str,
+    _elf_data: &[u8],
+    elf_header: &ElfHeader,
+    phdrs: &[ProgramHeader],
+    hash_info: Option<&HashSegmentInfo>,
+    arb: Option<u32>,
+    elf_class: u8,
+) {
+    println!("File: {}", path);
+    println!(
+        "Format: ELF ({})",
+        if elf_class == elf_defs::ELFCLASS32 {
+            "32-bit"
+        } else {
+            "64-bit"
+        }
+    );
+    println!("Entry point: 0x{:x}", elf_header.e_entry);
+    println!("Machine: 0x{:x}", elf_header.e_machine);
+    println!("Type: 0x{:x}", elf_header.e_type);
+    println!("Flags: 0x{:x}", elf_header.e_flags);
+    println!("Program headers: {}", elf_header.e_phnum);
+    println!();
+
+    println!("Program Headers:");
+    for (i, phdr) in phdrs.iter().enumerate() {
+        let flags = phdr.p_flags;
+        let perm = elf_defs::get_perm_value(flags);
+        let os_seg_type = p_flags_os_segment_type(flags);
+        let os_access = p_flags_os_access_type(flags);
+        let os_page_mode = p_flags_os_page_mode(flags);
+
+        println!(
+            "  [{}] Type: {} Offset: 0x{:x} VAddr: 0x{:x} FileSize: 0x{:x} MemSize: 0x{:x}",
+            i,
+            p_type_to_string(phdr.p_type),
+            phdr.p_offset,
+            phdr.p_vaddr,
+            phdr.p_filesz,
+            phdr.p_memsz
+        );
+        println!(
+            "      Flags: {:#x} Perm: {} OS_Type: {} OS_Access: {} Page_Mode: {}",
+            flags,
+            perm_to_string(perm),
+            os_segment_type_to_string(os_seg_type),
+            os_access_type_to_string(os_access),
+            os_page_mode_to_string(os_page_mode),
+        );
+    }
+    println!();
+
+    if let Some(ht) = hash_info {
+        let hdr = &ht.header;
+        println!("Hash Table Segment Header:");
+        println!("  Version: {}", hdr.version());
+        println!("  Common Metadata Size: {} (bytes)", hdr.common_metadata_size());
+        println!("  QTI Metadata Size: {} (bytes)", hdr.qti_metadata_size());
+        println!("  OEM Metadata Size: {} (bytes)", hdr.oem_metadata_size());
+        println!("  Hash Table Size: {} (bytes)", hdr.hash_table_size());
+        println!("  QTI Signature Size: {} (bytes)", hdr.qti_signature_size());
+        println!(
+            "  QTI Cert Chain Size: {} (bytes)",
+            hdr.qti_certificate_chain_size()
+        );
+        println!("  OEM Signature Size: {} (bytes)", hdr.oem_signature_size());
+        println!(
+            "  OEM Cert Chain Size: {} (bytes)",
+            hdr.oem_certificate_chain_size()
+        );
+        println!();
+        let status = ht.signature_status();
+        use crate::hash_segment::parser::SignatureStatus;
+        match status {
+            SignatureStatus::Both => println!("Signed: Yes (QTI + OEM)"),
+            SignatureStatus::QtiOnly => println!("Signed: Yes (QTI only)"),
+            SignatureStatus::OemOnly => println!("Signed: Yes (OEM only)"),
+            SignatureStatus::Unsigned => println!("Signed: No"),
+        }
+        if ht.is_signed() {
+            if ht.is_qti_signed() {
+                println!("  QTI signature: {} bytes, certificate chain: {} bytes",
+                    hdr.qti_signature_size(), hdr.qti_certificate_chain_size());
+            }
+            if ht.is_oem_signed() {
+                println!("  OEM signature: {} bytes, certificate chain: {} bytes",
+                    hdr.oem_signature_size(), hdr.oem_certificate_chain_size());
+            }
+        }
+        println!();
+
+        if let Some(ref cm) = ht.common_metadata {
+            println!("Common Metadata:");
+            println!("  Version: {}", cm.get_version_string());
+            match cm {
+                CommonMetadata::V00(m) => {
+                    println!("  Software ID: 0x{:x}", m.software_id);
+                    println!("  Secondary Software ID: 0x{:x}", m.secondary_software_id);
+                    let hash_algo = match m.hash_table_algorithm {
+                        2 => "SHA256",
+                        3 => "SHA384",
+                        5 => "SHA512",
+                        _ => "NA/Unknown",
+                    };
+                    println!("  Hash Table Algorithm: {} ({})", hash_algo, m.hash_table_algorithm);
+                    println!("  Measurement Register Target: {}", m.measurement_register_target);
+                }
+                CommonMetadata::V01(m) => {
+                    println!("  Software ID: 0x{:x}", m.base.software_id);
+                    println!("  Secondary Software ID: 0x{:x}", m.base.secondary_software_id);
+                    let hash_algo = match m.base.hash_table_algorithm {
+                        2 => "SHA256",
+                        3 => "SHA384",
+                        5 => "SHA512",
+                        _ => "NA/Unknown",
+                    };
+                    println!("  Hash Table Algorithm: {} ({})", hash_algo, m.base.hash_table_algorithm);
+                    println!("  Measurement Register Target: {}", m.base.measurement_register_target);
+                    println!("  ZI Segment Hash Algorithm: {}", m.zi_segment_hash_algorithm);
+                }
+            }
+            println!();
+        }
+
+        if let Some(ref om) = ht.oem_metadata {
+            println!("OEM Metadata:");
+            println!("  Version: {}", om.get_version_string());
+            println!("  Anti-Rollback Version: {}", om.get_arb_version());
+            match om {
+                Metadata::V00(m) => {
+                    println!("  Software ID: 0x{:x}", m.software_id);
+                    println!("  OEM ID: 0x{:x}", m.oem_id);
+                    println!("  OEM Product ID: 0x{:x}", m.oem_product_id);
+                    println!("  MRC Index: {}", m.mrc_index);
+                    println!("  Secondary Software ID: 0x{:x}", m.secondary_software_id);
+                    println!("  Flags: 0x{:x}", m.flags);
+                }
+                Metadata::V10(m) => {
+                    println!("  Software ID: 0x{:x}", m.base.software_id);
+                    println!("  OEM ID: 0x{:x}", m.base.oem_id);
+                    println!("  OEM Product ID: 0x{:x}", m.base.oem_product_id);
+                    println!("  MRC Index: {}", m.base.mrc_index);
+                    println!("  Secondary Software ID: 0x{:x}", m.base.secondary_software_id);
+                    println!("  Flags: 0x{:x}", m.base.flags);
+                }
+                Metadata::V20(m) => {
+                    println!("  SoC Feature ID: 0x{:x}", m.soc_feature_id);
+                    println!("  OEM ID: 0x{:x}", m.oem_id);
+                    println!("  OEM Product ID: 0x{:x}", m.oem_product_id);
+                    println!("  MRC Index: {}", m.mrc_index);
+                    println!("  SoC Lifecycle State: {}", m.soc_lifecycle_state);
+                    println!("  OEM Lifecycle State: {}", m.oem_lifecycle_state);
+                    println!("  OEM Root Cert Hash Algo: {}", m.oem_root_certificate_hash_algorithm);
+                    println!("  JTAG ID: 0x{:x}", m.jtag_id);
+                    println!("  Flags: 0x{:x}", m.flags);
+                }
+                Metadata::V30(m) => {
+                    println!("  Product Segment ID: 0x{:x}", m.product_segment_id);
+                    println!("  OEM ID: 0x{:x}", m.base.oem_id);
+                    println!("  OEM Product ID: 0x{:x}", m.base.oem_product_id);
+                    println!("  MRC Index: {}", m.base.mrc_index);
+                    println!("  SoC Lifecycle State: {}", m.base.soc_lifecycle_state);
+                    println!("  OEM Lifecycle State: {}", m.base.oem_lifecycle_state);
+                    println!("  Flags: 0x{:x}", m.base.flags);
+                }
+                Metadata::V31(m) => {
+                    println!("  Product Segment ID: 0x{:x}", m.base.product_segment_id);
+                    println!("  OEM ID: 0x{:x}", m.base.base.oem_id);
+                    println!("  OEM Product ID: 0x{:x}", m.base.base.oem_product_id);
+                    println!("  MRC Index: {}", m.base.base.mrc_index);
+                    println!("  SoC Lifecycle State: {}", m.base.base.soc_lifecycle_state);
+                    println!("  OEM Lifecycle State: {}", m.base.base.oem_lifecycle_state);
+                    println!("  Flags: 0x{:x}", m.base.base.flags);
+                }
+            }
+            println!();
+        }
+
+        if ht.serial_num.is_some() || !ht.hashes.is_empty() {
+            println!("Hash Table Contents:");
+            if let Some(serial) = ht.serial_num {
+                println!("  Serial Number: {}", serial);
+            }
+            for (idx, hash) in ht.hashes.iter().enumerate() {
+                let hash_hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+                println!("  Hash[{}]: {}", idx, hash_hex);
+            }
+            println!();
+        }
+
+        if let Some(ref enc) = ht.encryption {
+            println!("Encryption Parameters:");
+            match &enc.etype {
+                hash_segment::encryption::EncryptionType::Qbec(q) => {
+                    println!("  Scheme: QBEC v{}", q.version);
+                    println!("  Total Size: {} bytes", q.total_size);
+                    println!(
+                        "  Encrypting Entity: {} ({})",
+                        qbec::encrypting_entity_str(q.encrypting_entity),
+                        q.encrypting_entity
+                    );
+                    if let Some(order) = q.encryption_order {
+                        println!(
+                            "  Encryption Order: {} ({})",
+                            qbec::encryption_order_str(order),
+                            order
+                        );
+                    } else {
+                        println!("  Encryption Order: Encrypted then Signed (v1 default)");
+                    }
+                    println!(
+                        "  Key Management Params Size: {} bytes",
+                        q.key_management_parameters_size
+                    );
+                    if let Some(ref name) = q.key_management_scheme_name {
+                        println!(
+                            "  Key Management Scheme: {} (id={})",
+                            name,
+                            q.key_management_scheme_id.unwrap_or(0)
+                        );
+                    }
+                    println!(
+                        "  Data Encryption Params Size: {} bytes",
+                        q.data_encryption_parameters_size
+                    );
+                    if let Some(ref name) = q.data_encryption_scheme_name {
+                        println!(
+                            "  Data Encryption Scheme: {} (id={})",
+                            name,
+                            q.data_encryption_scheme_id.unwrap_or(0)
+                        );
+                    }
+                    eprintln!(
+                        "  ERROR: firmware is encrypted (QBEC) cannot parse"
+                    );
+                    eprintln!(
+                        "  Reason: {} (order={:?})",
+                        q.key_management_scheme_name.as_deref().unwrap_or("QBEC"),
+                        q.encryption_order.map(|o| if o == 0 { "Encrypt-then-Sign" } else { "Sign-then-Encrypt" }).unwrap_or("v1 default"),
+                    );
+                }
+                hash_segment::encryption::EncryptionType::Uie(u) => {
+                    println!("  Scheme: UIE");
+                    println!("  EPS Count: {}", u.num_eps);
+                    println!("  EPS1 Offset: {}, Version: {}.{}", u.eps1_offset, u.eps1_major_version, u.eps1_minor_version);
+                    if u.eps2_offset != 0 {
+                        println!(
+                            "  EPS2 Offset: {}, Version: {}.{}",
+                            u.eps2_offset, u.eps2_major_version, u.eps2_minor_version
+                        );
+                    }
+                    eprintln!(
+                        "  ERROR: firmware is encrypted (UIE) cannot parse"
+                    );
+                }
+            }
+            println!();
+        }
+    }
+
+    if let Some(arb_val) = arb {
+        if arb_val <= ARB_VALUE_MAX {
+            println!("Anti-Rollback Version: {}", arb_val);
+        } else {
+            eprintln!("Warning: ARB value {} exceeds expected maximum.", arb_val);
+            println!("Anti-Rollback Version: {}", arb_val);
+        }
+    } else {
+        println!("Anti-Rollback Version: not present");
+    }
+}
+
+fn process_elf(
+    data: &[u8],
+    path: &str,
+    debug: bool,
+    fast_mode: bool,
+    verify_mode: bool,
+) -> anyhow::Result<()> {
+    debug_step(debug, 1, 6, "Opening and validating ELF file");
+
+    if data[elf_defs::EI_DATA] != ELFDATA2LSB {
+        anyhow::bail!(Error::ElfEndiannessMismatch(data[elf_defs::EI_DATA]));
+    }
+    debug_detail(debug, "  Endianness: little-endian (OK)");
+
+    if data.len() < 52 {
+        anyhow::bail!(Error::ElfHeaderTruncated {
+            len: data.len(),
+            need: 52,
+        });
+    }
+
+    let elf_header = ElfHeader::from_bytes(data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let elf_class = elf_header.elf_class;
+    if elf_class != elf_defs::ELFCLASS32 && elf_class != elf_defs::ELFCLASS64 {
+        anyhow::bail!(Error::ElfClassUnsupported(elf_class));
+    }
+
+    debug_detail(debug, &format!(
+        "  Class: {} | Entry: 0x{:x} | Machine: 0x{:x}",
+        if elf_class == elf_defs::ELFCLASS32 { "ELF32" } else { "ELF64" },
+        elf_header.e_entry,
+        elf_header.e_machine,
+    ));
+
+    debug_step(debug, 2, 6, "Reading program headers");
+
+    let parser = ElfParser::from_bytes(data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let phdrs = &parser.program_headers;
+
+    debug_detail(debug, &format!(
+        "  Program headers: {} at offset 0x{:x}, each {} bytes",
+        parser.header.e_phnum,
+        parser.header.e_phoff,
+        parser.header.e_phentsize,
+    ));
+
+    if debug {
+        print_phdr_debug(phdrs, elf_class);
+    }
+
+    debug_step(debug, 3, 6, "Scanning for HASH segment");
+
+    let hash_info = if let Some(hash_phdr) = parser.find_hash_segment() {
+        let offset = hash_phdr.p_offset as usize;
+        let seg_type = p_flags_os_segment_type(hash_phdr.p_flags);
+
+        debug_detail(debug, &format!(
+            "  Found candidate at offset=0x{:x}, filesz=0x{:x}, os_seg_type={}",
+            offset,
+            hash_phdr.p_filesz,
+            seg_type,
+        ));
+
+        match HashSegmentInfo::parse(data, offset) {
+            Ok(Some(info)) => {
+                debug_detail(debug, &format!(
+                    "  HASH segment version {}: cm_sz={}, qti_sz={}, oem_sz={}, hash_sz={}",
+                    info.header.version(),
+                    info.header.common_metadata_size(),
+                    info.header.qti_metadata_size(),
+                    info.header.oem_metadata_size(),
+                    info.header.hash_table_size(),
+                ));
+
+                if let Some(ref cm) = info.common_metadata {
+                    let algo_name = |id| match id {
+                        2 => "SHA256", 3 => "SHA384", 5 => "SHA512", _ => "NA",
+                    };
+                    debug_detail(debug, &format!(
+                        "  Common Metadata: v{}, hash_algo={}({})",
+                        cm.get_version_string(),
+                        algo_name(match cm {
+                            CommonMetadata::V00(m) => m.hash_table_algorithm,
+                            CommonMetadata::V01(m) => m.base.hash_table_algorithm,
+                        }),
+                        match cm {
+                            CommonMetadata::V00(m) => m.hash_table_algorithm,
+                            CommonMetadata::V01(m) => m.base.hash_table_algorithm,
+                        },
+                    ));
+                } else {
+                    debug_detail(debug, "  Common Metadata: absent");
+                }
+
+                if let Some(ref om) = info.oem_metadata {
+                    debug_detail(debug, &format!(
+                        "  OEM Metadata: v{}, ARB={}",
+                        om.get_version_string(),
+                        om.get_arb_version(),
+                    ));
+                } else {
+                    debug_detail(debug, "  OEM Metadata: absent");
+                }
+
+                debug_detail(debug, &format!(
+                    "  Hash table: {} entries, {} bytes",
+                    info.hashes.len(),
+                    info.hashes.len() * 32,
+                ));
+
+                if let Some(ref serial) = info.serial_num {
+                    debug_detail(debug, &format!("  Serial number: {}", serial));
+                }
+
+                let s = info.signature_status();
+                use crate::hash_segment::parser::SignatureStatus;
+                match s {
+                    SignatureStatus::Both => debug_detail(debug, "  Signed: Yes (QTI+OEM)"),
+                    SignatureStatus::QtiOnly => debug_detail(debug, "  Signed: Yes (QTI only)"),
+                    SignatureStatus::OemOnly => debug_detail(debug, "  Signed: Yes (OEM only)"),
+                    SignatureStatus::Unsigned => debug_detail(debug, "  Signed: No"),
+                }
+
+                if let Some(ref enc) = info.encryption {
+                    eprintln!(
+                        "[ERROR] firmware is encrypted ({}) cannot parse further",
+                        enc.scheme_name()
+                    );
+                } else {
+                    debug_detail(debug, "  Encryption: none");
+                }
+
+                Some(info)
+            }
+            Ok(None) => {
+                debug_detail(debug, "  HASH segment header found but plausibility check failed");
+                None
+            }
+            Err(e) => {
+                eprintln!("[WARN] Hash segment parse encountered an issue: {e}");
+                None
+            }
+        }
+    } else {
+        debug_detail(debug, "  No HASH segment found (no PHDR with OS segment type 2)");
+        None
+    };
+
+    let arb = hash_info.as_ref().and_then(|ht| ht.get_arb_version());
+
+    debug_step(debug, 4, 6, "Extracting anti-rollback version");
+    match arb {
+        Some(v) if v <= ARB_VALUE_MAX => debug_detail(debug, &format!("  ARB = {}", v)),
+        Some(v) => debug_detail(debug, &format!("  ARB = {} (exceeds max {})", v, ARB_VALUE_MAX)),
+        None => debug_detail(debug, "  ARB: not present in OEM metadata"),
+    }
+
+    debug_step(debug, 5, 6, "Verifying segment hashes");
+    if verify_mode || debug {
+        if let Some(ref ht) = hash_info {
+            if ht.hashes.is_empty() {
+                debug_detail(debug, "  Hash table empty, skipping verification");
+            } else {
+                let verifier = HashVerifier::new(data, phdrs, &parser.header);
+                match verifier.verify(&ht.hashes, ht.common_metadata.as_ref()) {
+                    Ok(()) => {
+                        debug_detail(debug, "  All segment hashes match (OK)");
+                        if verify_mode {
+                            eprintln!("[VERIFY] All segment hashes match.");
+                        }
+                    }
+                    Err(e) => {
+                        debug_detail(debug, &format!("  Hash verification FAILED: {e}"));
+                        eprintln!("[VERIFY] Hash verification failed: {}", e);
+                        if verify_mode {
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+        } else if verify_mode {
+            anyhow::bail!("No hash table found, cannot verify");
+        } else {
+            debug_detail(debug, "  No HASH segment, verification skipped");
+        }
+    }
+
+    debug_step(debug, 6, 6, "Producing output");
+
+    if fast_mode {
+        if let Some(arb_val) = arb {
+            if arb_val <= ARB_VALUE_MAX {
+                println!("{}", arb_val);
+            } else {
+                eprintln!("Warning: ARB value {} exceeds expected maximum.", arb_val);
+                println!("{}", arb_val);
+            }
+        } else {
+            eprintln!("No ARB version found in the image.");
+            if hash_info.is_some() {
+                eprintln!("  Hint: HASH segment exists but lacks OEM metadata with anti_rollback_version.");
+                eprintln!("  Possible reasons: No OEM metadata present, or metadata version is unrecognized.");
+            } else {
+                eprintln!("  Hint: No HASH segment found in this ELF image.");
+                eprintln!("  Possible reasons: Image is not a Qualcomm secure ELF, or uses an older format.");
+            }
+            std::process::exit(1);
+        }
+    } else {
+        print_full_output(path, data, &parser.header, phdrs, hash_info.as_ref(), arb, elf_class);
+    }
+
+    Ok(())
+}
+
+fn hash_table_end(info: &HashSegmentInfo, base_offset: usize) -> usize {
+    let hdr_size = hs_defs::hash_table_header_size(info.header.version());
+    base_offset + hdr_size
+        + info.header.common_metadata_size() as usize
+        + info.header.qti_metadata_size() as usize
+        + info.header.oem_metadata_size() as usize
+        + info.header.hash_table_size() as usize
+}
+
+fn debug_step(debug: bool, step: usize, total: usize, label: &str) {
+    if debug {
+        eprintln!("[DEBUG] ── Step {}/{}: {} ──", step, total, label);
+    }
+}
+
+fn debug_detail(debug: bool, msg: &str) {
+    if debug {
+        eprintln!("[DEBUG] {}", msg);
+    }
+}
+
+fn process_mbn(data: &[u8], path: &str, debug: bool, fast_mode: bool) -> anyhow::Result<()> {
+    debug_step(debug, 1, 3, "Reading MBN header");
+
+    if data.len() < 8 {
+        anyhow::bail!("MBN file too short: {} bytes, need at least 8", data.len());
+    }
+
+    let version = data::read_le_u32(data, 4);
+    debug_detail(debug, &format!("  Detected MBN version: {}", version));
+
+    if !hs_defs::is_valid_hash_segment_version(version) {
+        anyhow::bail!(Error::MbnUnsupportedVersion(version));
+    }
+
+    let mbn_parser = mbn::parser::MbnParser::from_bytes(data).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let header = &mbn_parser.header;
+
+    debug_step(debug, 2, 3, "Extracting image info");
+    debug_detail(debug, &format!(
+        "  Image ID: 0x{:x} | Code size: {} | Image size: {}",
+        header.image_id(),
+        header.code_size(),
+        header.image_size(),
+    ));
+
+    debug_step(debug, 3, 3, "Producing output");
+
+    if fast_mode {
+        println!("MBN format does not contain ARB field");
+    } else {
+        println!("File: {}", path);
+        println!("Format: MBN v{}", header.version());
+        println!("Image ID: 0x{:x}", header.image_id());
+        println!("Code size: {} bytes", header.code_size());
+        println!("Image size: {} bytes", header.image_size());
+        println!("ARB: not applicable");
+    }
+
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
+
+    if args.len() > 1 && args[1] == "secure-image" {
+        let secure_args = cli::secure_image::handler::parse_secure_image_args(&args[1..])?;
+        return handler::handle_secure_image(secure_args)
+            .map_err(|e| anyhow::anyhow!("{}", e));
+    }
+
     let mut debug = false;
-    let mut quick_mode = false;
-    let mut full_mode = false;
+    let mut fast_mode = false;
     let mut verify_mode = false;
     let mut path = None;
 
@@ -497,12 +653,8 @@ fn main() -> anyhow::Result<()> {
                 debug = true;
                 i += 1;
             }
-            "--quick" | "-q" => {
-                quick_mode = true;
-                i += 1;
-            }
-            "--full" | "-f" => {
-                full_mode = true;
+            "--fast" | "-a" => {
+                fast_mode = true;
                 i += 1;
             }
             "--verify" => {
@@ -510,7 +662,11 @@ fn main() -> anyhow::Result<()> {
                 i += 1;
             }
             "--version" | "-v" => {
-                println!("arb_inspector_next version {}", VERSION);
+                println!("arb_inspector_next v{}", VERSION);
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                cli::secure_image::cmdline_dict::print_help();
                 return Ok(());
             }
             _ => {
@@ -518,14 +674,10 @@ fn main() -> anyhow::Result<()> {
                     path = Some(args[i].clone());
                     i += 1;
                 } else {
-                    anyhow::bail!("Usage: {} [--debug] [--quick|--full] [--verify] [-v] <image>", args[0]);
+                    anyhow::bail!("Usage: {} [--debug] [--fast] [--verify] [-v] <image>", args[0]);
                 }
             }
         }
-    }
-
-    if !quick_mode && !full_mode {
-        quick_mode = true;
     }
 
     let path = path.context("No input file provided")?;
@@ -536,305 +688,17 @@ fn main() -> anyhow::Result<()> {
 
     match detect_file_type(&header_buf) {
         FileType::Elf => {
-            if debug {
-                eprintln!("[DEBUG] Detected ELF file");
-            }
-
-            if header_buf[EI_DATA] != ELFDATA2LSB {
-                anyhow::bail!("Not a little-endian ELF file");
-            }
-
-            let elf_class = header_buf[EI_CLASS];
-            if elf_class != ELFCLASS32 && elf_class != ELFCLASS64 {
-                anyhow::bail!("Unsupported ELF class");
-            }
-
-            if debug {
-                eprintln!("[DEBUG] ELF class: {}", if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" });
-            }
-
             file.seek(SeekFrom::Start(0))?;
             let mut full_data = Vec::new();
             file.read_to_end(&mut full_data)?;
-
-            if debug {
-                eprintln!("[DEBUG] Full ELF size: {} bytes", full_data.len());
-            }
-
-            let elf_with_hash = ElfWithHashTable::from_bytes(&full_data)?;
-
-            if debug {
-                eprintln!("[DEBUG] ELF entry: 0x{:x}", elf_with_hash.elf_info.e_entry);
-                eprintln!("[DEBUG] Program header offset: 0x{:x}", elf_with_hash.elf_info.e_phoff);
-                eprintln!("[DEBUG] Program header count: {}", elf_with_hash.elf_info.e_phnum);
-                eprintln!("[DEBUG] Program header size: {} bytes", elf_with_hash.elf_info.e_phentsize);
-
-                for (i, ph) in elf_with_hash.program_headers.iter().enumerate() {
-                    let flags = ph.p_flags;
-                    let perm = get_perm_value(flags);
-                    let os_seg = get_os_segment_type(flags);
-                    let os_access = get_os_access_type(flags);
-                    let os_page = get_os_page_mode(flags);
-                    eprintln!("[DEBUG] PH[{}]: type={:#x} offset=0x{:x} filesz=0x{:x} flags={:#x}",
-                        i, ph.p_type, ph.p_offset, ph.p_filesz, flags);
-                    eprintln!("[DEBUG]        Perm: {} OS_Seg: {} OS_Access: {} Page: {}",
-                        perm_to_string(perm), os_segment_type_to_string(os_seg),
-                        os_access_type_to_string(os_access), os_page_mode_to_string(os_page));
-                }
-
-                match elf_with_hash.compute_segment_hashes(&full_data) {
-                    Ok(computed_hashes) => {
-                        eprintln!("[DEBUG] Computed {} segment hashes:", computed_hashes.len());
-                        for (i, h) in computed_hashes.iter().enumerate() {
-                            eprintln!("[DEBUG]   Hash[{}]: {}", i, h.iter().map(|b| format!("{:02x}", b)).collect::<String>());
-                        }
-                    }
-                    Err(e) => eprintln!("[DEBUG] Failed to compute segment hashes: {}", e),
-                }
-            }
-
-            if verify_mode || debug {
-                if let Some(ref ht) = elf_with_hash.hash_table_info {
-                    let verifier = HashVerifier::new(
-                        &full_data,
-                        &elf_with_hash.program_headers,
-                        &elf_with_hash.elf_info,
-                    );
-                    match verifier.verify(&ht.hashes, ht.common_metadata.as_ref()) {
-                        Ok(()) => {
-                            eprintln!("[VERIFY] All segment hashes match.");
-                        }
-                        Err(e) => {
-                            eprintln!("[VERIFY] Hash verification failed: {}", e);
-                            if verify_mode {
-                                std::process::exit(1);
-                            }
-                        }
-                    }
-                } else if verify_mode {
-                    anyhow::bail!("No hash table found, cannot verify");
-                }
-            }
-
-            let arb = elf_with_hash.get_arb_version();
-
-            if debug {
-                if let Some(ref ht) = elf_with_hash.hash_table_info {
-                    eprintln!("[DEBUG] Found HASH segment header:");
-                    eprintln!("[DEBUG]   version: {}", ht.header.version);
-                    eprintln!("[DEBUG]   common_metadata_size: {}", ht.header.common_metadata_size);
-                    eprintln!("[DEBUG]   oem_metadata_size: {}", ht.header.oem_metadata_size);
-                    eprintln!("[DEBUG]   hash_table_size: {}", ht.header.hash_table_size);
-                } else {
-                    eprintln!("[DEBUG] No HASH segment header found");
-                }
-
-                if let Some(arb_val) = arb {
-                    eprintln!("[DEBUG] Extracted ARB: {}", arb_val);
-                }
-            }
-
-            if quick_mode {
-                if let Some(arb_val) = arb {
-                    if arb_val <= ARB_VALUE_MAX {
-                        println!("{}", arb_val);
-                    } else {
-                        eprintln!("Warning: ARB value {} exceeds expected maximum.", arb_val);
-                        println!("{}", arb_val);
-                    }
-                } else {
-                    eprintln!("No ARB version found in the image");
-                    std::process::exit(1);
-                }
-            } else if full_mode {
-                println!("File: {}", path);
-                println!("Format: ELF ({})", if elf_class == ELFCLASS32 { "32-bit" } else { "64-bit" });
-                println!("Entry point: 0x{:x}", elf_with_hash.elf_info.e_entry);
-                println!("Machine: 0x{:x}", elf_with_hash.elf_info.e_machine);
-                println!("Type: 0x{:x}", elf_with_hash.elf_info.e_type);
-                println!("Flags: 0x{:x}", elf_with_hash.elf_info.e_flags);
-                println!("Program headers: {}", elf_with_hash.elf_info.e_phnum);
-                println!();
-
-                println!("Program Headers:");
-                for (i, phdr) in elf_with_hash.program_headers.iter().enumerate() {
-                    let flags = phdr.p_flags;
-                    let perm = get_perm_value(flags);
-                    let os_seg_type = get_os_segment_type(flags);
-                    let os_access = get_os_access_type(flags);
-                    let os_page_mode = get_os_page_mode(flags);
-
-                    println!("  [{}] Type: {} Offset: 0x{:x} VAddr: 0x{:x} FileSize: 0x{:x} MemSize: 0x{:x}",
-                        i,
-                        p_type_to_string(phdr.p_type),
-                        phdr.p_offset,
-                        phdr.p_vaddr,
-                        phdr.p_filesz,
-                        phdr.p_memsz);
-                    println!("      Flags: {:#x} Perm: {} OS_Type: {} OS_Access: {} Page_Mode: {}",
-                        flags,
-                        perm_to_string(perm),
-                        os_segment_type_to_string(os_seg_type),
-                        os_access_type_to_string(os_access),
-                        os_page_mode_to_string(os_page_mode));
-                }
-                println!();
-
-                if let Some(ref ht) = elf_with_hash.hash_table_info {
-                    println!("Hash Table Segment Header:");
-                    println!("  Version: {}", ht.header.version);
-                    println!("  Common Metadata Size: {} (bytes)", ht.header.common_metadata_size);
-                    println!("  QTI Metadata Size: {} (bytes)", ht.header.qti_metadata_size);
-                    println!("  OEM Metadata Size: {} (bytes)", ht.header.oem_metadata_size);
-                    println!("  Hash Table Size: {} (bytes)", ht.header.hash_table_size);
-                    println!("  QTI Signature Size: {} (bytes)", ht.header.qti_sig_size);
-                    println!("  QTI Cert Chain Size: {} (bytes)", ht.header.qti_cert_chain_size);
-                    println!("  OEM Signature Size: {} (bytes)", ht.header.oem_sig_size);
-                    println!("  OEM Cert Chain Size: {} (bytes)", ht.header.oem_cert_chain_size);
-                    println!();
-
-                    if let Some(ref cm) = ht.common_metadata {
-                        println!("Common Metadata:");
-                        println!("  Version: {}", cm.get_version_string());
-                        match cm {
-                            metadata::CommonMetadata::V00(m) => {
-                                println!("  One-shot Hash Algorithm: {}", m.one_shot_hash_algorithm);
-                                println!("  Segment Hash Algorithm: {}", m.segment_hash_algorithm);
-                            }
-                            metadata::CommonMetadata::V01(m) => {
-                                println!("  One-shot Hash Algorithm: {}", m.base.one_shot_hash_algorithm);
-                                println!("  Segment Hash Algorithm: {}", m.base.segment_hash_algorithm);
-                                println!("  ZI Segment Hash Algorithm: {}", m.zi_segment_hash_algorithm);
-                            }
-                        }
-                        println!();
-                    }
-
-                    if let Some(ref om) = ht.oem_metadata {
-                        println!("OEM Metadata:");
-                        println!("  Version: {}", om.get_version_string());
-                        println!("  Anti-Rollback Version: {}", om.get_arb_version());
-                        match om {
-                            metadata::Metadata::V00(m) => {
-                                println!("  Software ID: 0x{:x}", m.software_id);
-                                println!("  OEM ID: 0x{:x}", m.oem_id);
-                                println!("  OEM Product ID: 0x{:x}", m.oem_product_id);
-                                println!("  MRC Index: {}", m.mrc_index);
-                                println!("  Debug: {}", m.debug);
-                                println!("  Secondary Software ID: 0x{:x}", m.secondary_software_id);
-                                println!("  Flags: 0x{:x}", m.flags);
-                            }
-                            metadata::Metadata::V10(m) => {
-                                println!("  Software ID: 0x{:x}", m.base.software_id);
-                                println!("  OEM ID: 0x{:x}", m.base.oem_id);
-                                println!("  OEM Product ID: 0x{:x}", m.base.oem_product_id);
-                                println!("  MRC Index: {}", m.base.mrc_index);
-                                println!("  Debug: {}", m.base.debug);
-                                println!("  Secondary Software ID: 0x{:x}", m.base.secondary_software_id);
-                                println!("  Flags: 0x{:x}", m.base.flags);
-                                println!("  In-use JTAG ID: {}", m.in_use_jtag_id);
-                                println!("  OEM Product ID Independent: {}", m.oem_product_id_independent);
-                            }
-                            metadata::Metadata::V20(m) => {
-                                println!("  SoC Feature ID: 0x{:x}", m.soc_feature_id);
-                                println!("  OEM ID: 0x{:x}", m.oem_id);
-                                println!("  OEM Product ID: 0x{:x}", m.oem_product_id);
-                                println!("  MRC Index: {}", m.mrc_index);
-                                println!("  SoC Lifecycle State: {}", m.soc_lifecycle_state);
-                                println!("  OEM Lifecycle State: {}", m.oem_lifecycle_state);
-                                println!("  OEM Root Cert Hash Algo: {}", m.oem_root_certificate_hash_algorithm);
-                                println!("  Flags: 0x{:x}", m.flags);
-                            }
-                            metadata::Metadata::V30(m) => {
-                                println!("  SoC Feature ID: 0x{:x}", m.base.soc_feature_id);
-                                println!("  OEM ID: 0x{:x}", m.base.oem_id);
-                                println!("  OEM Product ID: 0x{:x}", m.base.oem_product_id);
-                                println!("  MRC Index: {}", m.base.mrc_index);
-                                println!("  SoC Lifecycle State: {}", m.base.soc_lifecycle_state);
-                                println!("  OEM Lifecycle State: {}", m.base.oem_lifecycle_state);
-                                println!("  QTI Lifecycle State: {}", m.qti_lifecycle_state);
-                                println!("  Flags: 0x{:x}", m.base.flags);
-                            }
-                            metadata::Metadata::V31(m) => {
-                                println!("  SoC Feature ID: 0x{:x}", m.base.base.soc_feature_id);
-                                println!("  OEM ID: 0x{:x}", m.base.base.oem_id);
-                                println!("  OEM Product ID: 0x{:x}", m.base.base.oem_product_id);
-                                println!("  MRC Index: {}", m.base.base.mrc_index);
-                                println!("  SoC Lifecycle State: {}", m.base.base.soc_lifecycle_state);
-                                println!("  OEM Lifecycle State: {}", m.base.base.oem_lifecycle_state);
-                                println!("  QTI Lifecycle State: {}", m.base.qti_lifecycle_state);
-                                println!("  Measurement Register Target: {}", m.measurement_register_target);
-                                println!("  Flags: 0x{:x}", m.base.base.flags);
-                            }
-                        }
-                        println!();
-                    }
-
-                    if ht.serial_num.is_some() || !ht.hashes.is_empty() {
-                        println!("Hash Table Contents:");
-                        if let Some(serial) = ht.serial_num {
-                            println!("  Serial Number: {}", serial);
-                        }
-                        for (idx, hash) in ht.hashes.iter().enumerate() {
-                            let hash_hex: String = hash.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("");
-                            println!("  Hash[{}]: {}", idx, hash_hex);
-                        }
-                        println!();
-                    }
-                }
-
-                if let Some(arb_val) = arb {
-                    if arb_val <= ARB_VALUE_MAX {
-                        println!("Anti-Rollback Version: {}", arb_val);
-                    } else {
-                        eprintln!("Warning: ARB value {} exceeds expected maximum.", arb_val);
-                        println!("Anti-Rollback Version: {}", arb_val);
-                    }
-                } else {
-                    println!("Anti-Rollback Version: not present");
-                }
-            }
+            process_elf(&full_data, &path, debug, fast_mode, verify_mode)?;
         }
-
         FileType::Mbn => {
-            if debug {
-                eprintln!("[DEBUG] Detected MBN file");
-            }
             file.seek(SeekFrom::Start(0))?;
             let mut full_data = Vec::new();
             file.read_to_end(&mut full_data)?;
-
-            if debug {
-                eprintln!("[DEBUG] Full MBN size: {} bytes", full_data.len());
-            }
-
-            let mbn = mbn::Mbn::from_bytes(&full_data)?;
-
-            if debug {
-                eprintln!("[DEBUG] MBN version: {}", mbn.header.version);
-                eprintln!("[DEBUG] Image ID: 0x{:x}", mbn.header.image_id);
-                eprintln!("[DEBUG] Code size: {}", mbn.header.code_size);
-                eprintln!("[DEBUG] Image size: {}", mbn.header.image_size);
-                eprintln!("[DEBUG] Signature ptr: 0x{:x}", mbn.header.sig_ptr);
-                eprintln!("[DEBUG] Signature size: {}", mbn.header.sig_size);
-                eprintln!("[DEBUG] Certificate chain ptr: 0x{:x}", mbn.header.cert_chain_ptr);
-                eprintln!("[DEBUG] Certificate chain size: {}", mbn.header.cert_chain_size);
-            }
-
-            if quick_mode {
-                println!("MBN format does not contain ARB field");
-            } else if full_mode {
-                println!("File: {}", path);
-                println!("Format: MBN v{}", mbn.header.version);
-                println!("Image ID: 0x{:x}", mbn.header.image_id);
-                println!("Code size: {} bytes", mbn.header.code_size);
-                println!("Image size: {} bytes", mbn.header.image_size);
-                println!("Signature ptr: 0x{:x}, size: {}", mbn.header.sig_ptr, mbn.header.sig_size);
-                println!("Certificate chain ptr: 0x{:x}, size: {}", mbn.header.cert_chain_ptr, mbn.header.cert_chain_size);
-                println!("ARB: not applicable");
-            }
+            process_mbn(&full_data, &path, debug, fast_mode)?;
         }
-
         FileType::Unknown => {
             anyhow::bail!("Unknown file format (not ELF or MBN)");
         }
