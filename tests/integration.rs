@@ -62,7 +62,7 @@ fn make_elf_with_hash() -> Vec<u8> {
     let hash_off: u32 = seg_off + seg_data.len() as u32;
 
     // Build hash segment content
-    let hs = arb_inspector_lib::hash_segment::metadata::test_hash_segment_v7(42, 0x1c, 3, 3);
+    let hs = arb_inspector::hash_segment::metadata::test_hash_segment_v7(42, 0x1c, 3, 3);
     let hash_filesz = hs.len() as u32;
 
     let mut d = Vec::new();
