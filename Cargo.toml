@@ -1,5 +1,5 @@
 [package]
-name = "arb_inspector_next"
+name = "arb_inspector"
 version = "0.4.0"
 authors = ["Dere"]
 license = "MIT"
@@ -35,5 +35,5 @@ name = "arb_inspector"
 path = "src/main.rs"
 
 [lib]
-name = "arb_inspector_lib"
+name = "arb_inspector"
 path = "src/lib.rs"
